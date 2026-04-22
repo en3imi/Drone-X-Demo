@@ -1,7 +1,6 @@
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import cv2
 import io
 from ultralytics import YOLO
 
@@ -50,13 +49,6 @@ st.markdown(
         padding: 1rem;
     }
 
-    /* Result image container */
-    .result-img {
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.1);
-        overflow: hidden;
-    }
-
     /* Confidence badge */
     .conf-badge {
         display: inline-block;
@@ -81,15 +73,35 @@ def load_model(path: str = "best.pt") -> YOLO:
     return YOLO(path)
 
 
+# ── Drawing constants ─────────────────────────────────────────────────────────
+BOX_COLOR    = "#7f5af0"          # purple hex
+TEXT_COLOR   = "#ffffff"
+BADGE_ALPHA  = 220                # 0-255 opacity for badge fill
+BOX_WIDTH    = 3                  # bounding box line width (px)
+FONT_SIZE    = 16
+
+
+def _get_font(size: int = FONT_SIZE) -> ImageFont.ImageFont:
+    """Try to load a TTF; fall back to Pillow's built-in bitmap font."""
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+
 # ── Inference helper ──────────────────────────────────────────────────────────
-BOX_COLOR  = (127, 90, 240)   # purple
-TEXT_COLOR = (255, 255, 255)
-FONT       = cv2.FONT_HERSHEY_SIMPLEX
-
-
-def run_inference(model: YOLO, image: Image.Image, conf_thresh: float, iou_thresh: float):
-    """Run YOLO on a PIL image. Returns annotated image (BGR numpy) + result list."""
-    img_np = np.array(image.convert("RGB"))
+def run_inference(
+    model: YOLO,
+    image: Image.Image,
+    conf_thresh: float,
+    iou_thresh: float,
+):
+    """Run YOLO on a PIL image. Returns annotated PIL image + detection list."""
+    img_rgb = image.convert("RGB")
+    img_np  = np.array(img_rgb)
 
     results = model.predict(
         source=img_np,
@@ -98,8 +110,9 @@ def run_inference(model: YOLO, image: Image.Image, conf_thresh: float, iou_thres
         verbose=False,
     )
 
-    result   = results[0]
-    img_draw = img_np.copy()
+    result     = results[0]
+    draw       = ImageDraw.Draw(img_rgb, "RGBA")
+    font       = _get_font(FONT_SIZE)
     detections = []
 
     if result.boxes is not None:
@@ -111,16 +124,26 @@ def run_inference(model: YOLO, image: Image.Image, conf_thresh: float, iou_thres
 
             detections.append({"label": label, "conf": conf, "bbox": (x1, y1, x2, y2)})
 
-            # Draw bounding box
-            cv2.rectangle(img_draw, (x1, y1), (x2, y2), BOX_COLOR, 2)
+            # Bounding box
+            draw.rectangle([x1, y1, x2, y2], outline=BOX_COLOR, width=BOX_WIDTH)
 
-            # Badge background
-            tag   = f"{label}  {conf:.0%}"
-            (tw, th), _ = cv2.getTextSize(tag, FONT, 0.55, 1)
-            cv2.rectangle(img_draw, (x1, y1 - th - 10), (x1 + tw + 8, y1), BOX_COLOR, -1)
-            cv2.putText(img_draw, tag, (x1 + 4, y1 - 4), FONT, 0.55, TEXT_COLOR, 1, cv2.LINE_AA)
+            # Label badge
+            tag = f" {label}  {conf:.0%} "
+            bbox_text = draw.textbbox((0, 0), tag, font=font)
+            tw = bbox_text[2] - bbox_text[0]
+            th = bbox_text[3] - bbox_text[1]
 
-    return img_draw, detections
+            badge_y0 = max(y1 - th - 8, 0)
+            badge_y1 = max(y1, th + 8)
+
+            # Semi-transparent filled badge
+            draw.rectangle(
+                [x1, badge_y0, x1 + tw + 4, badge_y1],
+                fill=(127, 90, 240, BADGE_ALPHA),
+            )
+            draw.text((x1 + 2, badge_y0 + 2), tag.strip(), fill=TEXT_COLOR, font=font)
+
+    return img_rgb, detections
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -156,7 +179,10 @@ with st.sidebar:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 st.markdown("# 🚗 Car Movement Detection")
-st.markdown("Upload an image and the model will locate every vehicle with bounding boxes and confidence scores.")
+st.markdown(
+    "Upload an image and the model will locate every vehicle "
+    "with bounding boxes and confidence scores."
+)
 
 uploaded_file = st.file_uploader(
     "Drop an image here or click to browse",
@@ -166,22 +192,22 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
-
     model = load_model()
 
     with st.spinner("Running inference…"):
         annotated, detections = run_inference(model, image, conf_threshold, iou_threshold)
 
-    # ── Compute average confidence ───────────────────────────────────────────
-    avg_conf = np.mean([d["conf"] for d in detections]) if detections else 0.0
+    # ── Average confidence ────────────────────────────────────────────────────
+    avg_conf = float(np.mean([d["conf"] for d in detections])) if detections else 0.0
+    max_conf = max((d["conf"] for d in detections), default=0.0)
 
-    # Update page title dynamically via JS trick
+    # Dynamic browser-tab title
     st.markdown(
         f"<script>document.title = 'Avg Conf: {avg_conf:.0%} | Car Detection';</script>",
         unsafe_allow_html=True,
     )
 
-    # ── Metrics row ──────────────────────────────────────────────────────────
+    # ── Metric cards ──────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
@@ -200,7 +226,6 @@ if uploaded_file is not None:
             unsafe_allow_html=True,
         )
     with c3:
-        max_conf = max((d["conf"] for d in detections), default=0.0)
         st.markdown(
             f"""<div class="metric-card">
                   <p>Peak Confidence</p>
@@ -224,9 +249,7 @@ if uploaded_file is not None:
             f"<span class='conf-badge'>Avg {avg_conf:.1%}</span>",
             unsafe_allow_html=True,
         )
-        # Convert BGR → RGB for Streamlit
-        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        st.image(annotated_rgb, use_container_width=True)
+        st.image(annotated, use_container_width=True)
 
     # ── Detection table ───────────────────────────────────────────────────────
     if detections:
@@ -244,7 +267,7 @@ if uploaded_file is not None:
 
     # ── Download button ───────────────────────────────────────────────────────
     buf = io.BytesIO()
-    Image.fromarray(annotated_rgb).save(buf, format="PNG")
+    annotated.save(buf, format="PNG")
     st.download_button(
         label="⬇️ Download Annotated Image",
         data=buf.getvalue(),
@@ -253,7 +276,6 @@ if uploaded_file is not None:
     )
 
 else:
-    # Placeholder state
     st.markdown(
         """
         <div style="
